@@ -1,0 +1,267 @@
+#include <Arduino.h>
+
+// Sample RFM69 receiver/gateway sketch, with ACK and optional encryption, and Automatic Transmission Control
+// Passes through any wireless received messages to the serial port & responds to ACKs
+// It also looks for an onboard FLASH chip, if present
+// **********************************************************************************
+// Copyright Felix Rusu 2016, http://www.LowPowerLab.com/contact
+// **********************************************************************************
+// License
+// **********************************************************************************
+// This program is free software; you can redistribute it 
+// and/or modify it under the terms of the GNU General    
+// Public License as published by the Free Software       
+// Foundation; either version 3 of the License, or        
+// (at your option) any later version.                    
+//                                                        
+// This program is distributed in the hope that it will   
+// be useful, but WITHOUT ANY WARRANTY; without even the  
+// implied warranty of MERCHANTABILITY or FITNESS FOR A   
+// PARTICULAR PURPOSE. See the GNU General Public        
+// License for more details.                              
+//                                                        
+// Licence can be viewed at                               
+// http://www.gnu.org/licenses/gpl-3.0.txt
+//
+// Please maintain this license information along with authorship
+// and copyright notices in any redistribution of this code
+// **********************************************************************************
+#include <RFM69.h>         //get it here: https://www.github.com/lowpowerlab/rfm69
+#include <RFM69_ATC.h>     //get it here: https://www.github.com/lowpowerlab/rfm69
+#include <SPIFlash.h>      //get it here: https://www.github.com/lowpowerlab/spiflash
+#include <SPI.h>           //included with Arduino IDE install (www.arduino.cc)
+#include <Adafruit_INA219.h>
+#include <Wire.h>
+#define STREAM_ID_INFO_STR "\x1"
+//*********************************************************************************************
+//************ IMPORTANT SETTINGS - YOU MUST CHANGE/CONFIGURE TO FIT YOUR HARDWARE *************
+//*********************************************************************************************
+#define NODEID        5    //unique for each node on same network
+#define NETWORKID     100  //the same on all nodes that talk to each other
+//Match frequency to the hardware version of the radio on your Moteino (uncomment one):
+//#define FREQUENCY     RF69_433MHZ
+//#define FREQUENCY     RF69_868MHZ
+#define FREQUENCY     RF69_915MHZ
+#define ENCRYPTKEY    "sampleEncryptKey" //exactly the same 16 characters/bytes on all nodes!
+//#define IS_RFM69HW_HCW  //uncomment only for RFM69HW/HCW! Leave out if you have RFM69W/CW!
+//*********************************************************************************************
+//Auto Transmission Control - dials down transmit power to save battery
+//Usually you do not need to always transmit at max output power
+//By reducing TX power even a little you save a significant amount of battery power
+//This setting enables this gateway to work with remote nodes that have ATC enabled to
+//dial their power down to only the required level
+#define ENABLE_ATC    //comment out this line to disable AUTO TRANSMISSION CONTROL
+//*********************************************************************************************
+#define SERIAL_BAUD   38400
+
+#ifdef __AVR_ATmega1284P__
+  #define LED           15 // Moteino MEGAs have LEDs on D15
+  #define FLASH_SS      23 // and FLASH SS on D23
+#else
+  #define LED           9 // Moteinos have LEDs on D9
+  #define FLASH_SS      8 // and FLASH SS on D8
+#endif
+
+#ifdef ENABLE_ATC
+  RFM69_ATC radio;
+#else
+  RFM69 radio;
+#endif
+
+#define GATEWAYID 1
+
+SPIFlash flash(FLASH_SS, 0xEF30); //EF30 for 4mbit  Windbond chip (W25X40CL)
+bool promiscuousMode = false; //set to 'true' to sniff all packets on the same network
+
+String inputString;
+bool stringComplete;
+unsigned long timeOfNextPowerMessage;
+Adafruit_INA219 ina219;
+void setup() {
+  inputString.reserve(130);
+  inputString = "";
+  stringComplete = false;
+
+  ina219.begin(); 
+  Serial.begin(SERIAL_BAUD);
+  delay(10);
+  radio.initialize(FREQUENCY,NODEID,NETWORKID);
+#ifdef IS_RFM69HW_HCW
+  radio.setHighPower(); //must include this only for RFM69HW/HCW!
+#endif
+  radio.encrypt(ENCRYPTKEY);
+  radio.promiscuous(promiscuousMode);
+  //radio.setFrequency(919000000); //set frequency to some custom frequency
+  char buff[50];
+  sprintf(buff, "\nListening at %d Mhz...", FREQUENCY==RF69_433MHZ ? 433 : FREQUENCY==RF69_868MHZ ? 868 : 915);
+  Serial.println(buff);
+  if (flash.initialize())
+  {
+    Serial.print("SPI Flash Init OK. Unique MAC = [");
+    flash.readUniqueId();
+    for (byte i=0;i<8;i++)
+    {
+      Serial.print(flash.UNIQUEID[i], HEX);
+      if (i!=8) Serial.print(':');
+    }
+    Serial.println(']');
+    
+    //alternative way to read it:
+    //byte* MAC = flash.readUniqueId();
+    //for (byte i=0;i<8;i++)
+    //{
+    //  Serial.print(MAC[i], HEX);
+    //  Serial.print(' ');
+    //}
+  }
+  else
+    Serial.println("SPI Flash MEM not found (is chip soldered?)...");
+    
+#ifdef ENABLE_ATC
+  Serial.println("RFM69_ATC Enabled (Auto Transmission Control)");
+#endif
+    timeOfNextPowerMessage=millis()+5000;
+}
+
+void Blink(byte PIN, int DELAY_MS);
+
+
+byte ackCount=0;
+uint32_t packetCount = 0;
+
+
+int stringToData(const char* inputString, uint8_t* dataBuffer)
+{
+    int len = strlen(inputString)/2;
+    char twoChar[3];
+    twoChar[2] = '\0';
+    for(int i = 0; i < len; ++i)
+    {
+
+      twoChar[0] = *inputString;
+      twoChar[1] = *(inputString+1);
+      inputString += 2;
+
+      dataBuffer[i] = strtoul(twoChar, 0, 16);
+    }
+    return len;
+}
+
+
+void printDataAsHex(uint8_t* dataBuffer, int len)
+{
+    for(int i = 0; i < len; ++i)
+    {
+      char twoChar[3];
+
+      sprintf(twoChar, "%02x", dataBuffer[i]);
+      Serial.print(twoChar);
+    }
+}
+
+void mySerialEvent();
+
+void loop() {
+
+  unsigned long time = millis();
+  mySerialEvent();
+
+  // Data received from the radio gets delivered to Serial as 
+  // hexidecimal 2 chars per byte no spaces, followed by EOL.
+  if (radio.receiveDone())
+  {
+    printDataAsHex((uint8_t*)radio.DATA, radio.DATALEN);
+    Serial.print('\n');
+
+    if (radio.ACKRequested())
+    {
+      radio.sendACK();
+    }
+  }
+
+  if (time > timeOfNextPowerMessage)
+  { 
+    float busvoltage = 0;  
+    float current_mA = 0;   
+    busvoltage = ina219.getBusVoltage_V();  
+    current_mA = ina219.getCurrent_mA();  
+
+    char buff[62];
+    char busVStr[6] = "     ";
+    char currentStr[6] = "     ";
+    dtostrf((double)busvoltage,5,3,busVStr);
+    dtostrf((double)current_mA,5,3,currentStr);
+
+    sprintf(buff, STREAM_ID_INFO_STR "V:%s A:%s", busVStr, currentStr);
+        // send over radio
+    radio.send(GATEWAYID, buff, strlen(buff));
+    timeOfNextPowerMessage = time + 60000;
+  }
+}
+
+void Blink(byte PIN, int DELAY_MS)
+{
+  pinMode(PIN, OUTPUT);
+  digitalWrite(PIN,HIGH);
+  delay(DELAY_MS);
+  digitalWrite(PIN,LOW);
+}
+//
+bool copySerialInputToString(String& s)
+{
+    while (Serial.available()) {
+      // get the new byte:
+      char inChar = (char)Serial.read();
+      //Serial.print("char=");
+      //char buf[3];
+      //sprintf(buf,"%02x",(int)inChar);
+      //Serial.println(buf);
+        
+      if (isxdigit(inChar)) 
+      {
+        s += inChar;
+      }
+
+      if (inChar == '\n' || inChar == '\r') 
+      {
+        return true;
+      }
+    }
+    return false;
+}
+
+void mySerialEvent()
+{
+   if (Serial.available())
+   {
+      pinMode(LED, OUTPUT);
+      digitalWrite(LED,HIGH);
+
+      // add it to the inputString:
+      stringComplete = copySerialInputToString(inputString);
+
+      // if the incoming character is a newline, set a flag so the main loop can
+      // do something about it:
+   }
+
+   if (stringComplete) {
+    //Serial.print("inputString=");
+    //Serial.println(inputString.c_str());
+
+    // The string is bytes encoded as hexidecimal, 2 chars per byte, no spaces
+    // Translate to bytes before transmission.
+    // Radio supports up to 61 bytes.
+    uint8_t sendBuf[64];
+    int sendLen;
+    sendLen = stringToData(inputString.c_str(),sendBuf);
+
+    // clear the string:
+    inputString = "";
+    stringComplete = false;
+
+    // send over radio
+    radio.send(GATEWAYID, sendBuf, sendLen);
+  }
+
+  digitalWrite(LED,LOW);
+}
