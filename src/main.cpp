@@ -339,6 +339,20 @@ void Blink(byte PIN, int DELAY_MS)
   digitalWrite(PIN,LOW);
 }
 
+const int REQUEST_SERIAL_SYNC = 13;
+const int RETURN_SERIAL_SYNC = 12;
+
+void SendSerialSyncResponse(uint8_t serialNumber)
+{
+  uint8_t data[2];
+  data[0] = RETURN_SERIAL_SYNC;
+  data[1] = serialNumber;
+  printDataAsHex(data, 2);
+  Serial.print('\n');
+}
+
+// For debug.  TODO add this to a status message sent over the radio.
+uint32_t g_serialSyncCount = 0;
 
 void mySerialEvent()
 {
@@ -351,20 +365,23 @@ void mySerialEvent()
    // Keep processing messages until no data available.
    while (serialInputBuffer.TakeFromSerial())
    {
-     // TODO:
-    // If the sender doesn't see ok to send within some reasonable time duration, then they will send a new bridge_sync message containing a new serial number.
-    //   <bridge_sync_streamId><serial number>\n
+     // If the message is serial_sync, then respond on the serial port only and don't send over the radio.
+     if (serialInputBuffer.m_dataBuffer[0] == REQUEST_SERIAL_SYNC && serialInputBuffer.m_dataByteCount == 1)
+     {
+       // keep a count for debugging.  Serial sync request should be infrequent.
+       g_serialSyncCount++;
+     }
+     else 
+     {
+        // Send message over the radio. The serial number in the last byte was already removed from the data byte count.
+        // Choosing to send over the radio *before* giving the sender the ok to send more data.  
+        // This is because, if we spend too long inside radio.send, then the internal serial input buffer can overflow.
+        radio.send(GATEWAYID, serialInputBuffer.m_dataBuffer, serialInputBuffer.m_dataByteCount);
 
-    // Keep a count of bridge_sync because they should not occur in normal operation.
-
-    // If the message is the bridge_sync_streamId, then acknowledge it so that the sender will resume sending normal messages, but don't send bridge_sync over the radio.
-
-    // I'm choosing to send over the radio *before* giving the sender the ok to send more data.  
-    // This is because, if we spend too long inside radio.send, then the internal serial input buffer can overflow.
-    // NOTE: send over radio only if not bridge_sync.
-    radio.send(GATEWAYID, serialInputBuffer.m_dataBuffer, serialInputBuffer.m_dataByteCount);
-    
-    // TODO: Tell the sender message was recieved.  That will give them the ok to send the next message.
+     }
+     // Tell the sender that we are done and therefore ok to send more.
+     // Serial sync response is always sent.
+     SendSerialSyncResponse(serialInputBuffer.m_lastDataByte);
    }
 
   digitalWrite(LED,LOW);
