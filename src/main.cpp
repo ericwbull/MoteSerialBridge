@@ -68,6 +68,19 @@
   RFM69 radio;
 #endif
 
+#undef SERIAL_EN
+#ifdef SERIAL_EN
+#define DEBUG2(input1,input2) {Serial.print(input1,input2);}
+#define DEBUG(input)   {Serial.print(input); delay(1);}
+#define DEBUGln(input) {Serial.println(input); delay(1);}
+#define DEBUGFlush() { Serial.flush(); }
+#else
+#define DEBUG2(input1,input2);
+#define DEBUG(input);
+#define DEBUGln(input);
+#define DEBUGFlush();
+#endif
+
 #define GATEWAYID 1
 
 SPIFlash flash(FLASH_SS, 0xEF30); //EF30 for 4mbit  Windbond chip (W25X40CL)
@@ -76,15 +89,14 @@ bool promiscuousMode = false; //set to 'true' to sniff all packets on the same n
 class SerialInputBuffer
 {
   public:
-    uint8_t m_dataBuffer[62];
-    char m_charPair[3];    
+    uint8_t m_dataBuffer[63];
     uint8_t m_lastDataByte;
 
     // have serial number for the current message.
     bool m_haveSerialNumber;
 
     // the serial number of the previous message
-    int8_t m_prevSerialNumber;
+    uint8_t m_prevSerialNumber;
 
     int m_dataDigitCount;
     int m_dataByteCount;
@@ -106,8 +118,8 @@ class SerialInputBuffer
         m_prevSerialNumber = m_lastDataByte;
       }
 
+      m_dataBuffer[0] = 0;
       m_haveSerialNumber = false;
-      m_charPair[2] = '\0';
       m_lastDataByte = 0;
       m_dataDigitCount = 0;
       m_dataByteCount = 0;
@@ -116,11 +128,26 @@ class SerialInputBuffer
     }
 
     // c is a hex digit
+    uint8_t xDigitToNumber(char c)
+    {
+      c = toUpperCase(c);
+      if (c >= 'a')
+      {
+        return 10 + c - 'a';
+      }
+      if (c >= 'A')
+      {
+        return 10 + c - 'A';
+      }
+      return c - '0';
+    }
+
+    // c is a hex digit
     void updateLastByteBuffer(char c)
     {
-      m_lastDataByte >>= 4;
-      uint8_t cAsInt = c - '0';
-      m_lastDataByte |= cAsInt << 4;
+      m_lastDataByte <<= 4;
+      m_lastDataByte |= xDigitToNumber(c);
+      DEBUGln(m_lastDataByte);
     }
 
     // c is a hex digit
@@ -128,14 +155,15 @@ class SerialInputBuffer
     {
       if ((m_dataDigitCount % 2) == 1)
       {
-        // This is the second of a pair of digits
-        m_charPair[1] = c;
-        m_dataBuffer[m_dataByteCount] = strtoul(m_charPair, 0, 16);
+        // This is the second (lsb) of a pair of digits
+        m_dataBuffer[m_dataByteCount] |= xDigitToNumber(c);
         m_dataByteCount++;
+        // Clear out the next byte
+        m_dataBuffer[m_dataByteCount] = 0;
       }
       else
       {
-        m_charPair[0] = c;
+        m_dataBuffer[m_dataByteCount] |= (xDigitToNumber(c) << 4);
       }
 
       m_dataDigitCount++;
@@ -150,8 +178,9 @@ class SerialInputBuffer
     void endMessage()
     {
       // Message termination received.  Is the message any good?
-
-      if (m_dataDigitCount >= 2)
+//DEBUG("m_dataDigitCount="); DEBUGln(m_dataDigitCount);
+//DEBUG("m_dataByteCount="); DEBUGln(m_dataByteCount);
+       if (m_dataDigitCount >= 2)
       {
         // Interpret the last two digits as serial number even if they are out of alignment and the message is in error.
         m_haveSerialNumber = true;
@@ -170,9 +199,10 @@ class SerialInputBuffer
             // Reduce the data size by one byte because the last byte is the serial number.
             m_dataByteCount -= 1;
             m_dataDigitCount -= 2;
-
+//DEBUG("m_lastDataByte="); DEBUGln(m_lastDataByte);
+//DEBUG("m_prevSerialNumber="); DEBUGln(m_prevSerialNumber);
             // Verify good serial number
-            if (m_lastDataByte == (m_prevSerialNumber + 1))
+            if (m_lastDataByte == (uint8_t)(m_prevSerialNumber + 1))
             {
               // All is good.
               // At this point the client will consume the message and notify the sender.
@@ -195,6 +225,7 @@ class SerialInputBuffer
     {
       if (m_complete)
       {
+//        DEBUGln("Start new message");
         // The client already consumed the completed message before calling TakeFromSerial.
         startNewMessage();
       }
@@ -204,6 +235,7 @@ class SerialInputBuffer
       {
         char c = (char)Serial.read();
 
+  //      DEBUG("read=");DEBUG(c);DEBUGln("");
         if (isxdigit(c))
         {
           addXDigit(c);
@@ -227,6 +259,8 @@ class SerialInputBuffer
 
 SerialInputBuffer serialInputBuffer;
 
+
+
 unsigned long timeOfNextPowerMessage;
 Adafruit_INA219 ina219;
 void setup() {
@@ -241,32 +275,36 @@ void setup() {
   radio.promiscuous(promiscuousMode);
   //radio.setFrequency(919000000); //set frequency to some custom frequency
   char buff[50];
+
   sprintf(buff, "\nListening at %d Mhz...", FREQUENCY==RF69_433MHZ ? 433 : FREQUENCY==RF69_868MHZ ? 868 : 915);
-  Serial.println(buff);
+  DEBUGln(buff);
+
   if (flash.initialize())
   {
-    Serial.print("SPI Flash Init OK. Unique MAC = [");
+
+    DEBUG("SPI Flash Init OK. Unique MAC = [");
+ 
     flash.readUniqueId();
     for (byte i=0;i<8;i++)
     {
-      Serial.print(flash.UNIQUEID[i], HEX);
-      if (i!=8) Serial.print(':');
+      DEBUG2(flash.UNIQUEID[i], HEX);
+      if (i!=8) DEBUG(':');
     }
-    Serial.println(']');
+    DEBUGln(']');
     
     //alternative way to read it:
     //byte* MAC = flash.readUniqueId();
     //for (byte i=0;i<8;i++)
     //{
-    //  Serial.print(MAC[i], HEX);
-    //  Serial.print(' ');
+    //  DEBUG(MAC[i], HEX);
+    //  DEBUG(' ');
     //}
   }
   else
-    Serial.println("SPI Flash MEM not found (is chip soldered?)...");
+    DEBUGln("SPI Flash MEM not found (is chip soldered?)...");
     
 #ifdef ENABLE_ATC
-  Serial.println("RFM69_ATC Enabled (Auto Transmission Control)");
+  DEBUGln("RFM69_ATC Enabled (Auto Transmission Control)");
 #endif
     timeOfNextPowerMessage=millis()+5000;
 }
@@ -365,14 +403,19 @@ void mySerialEvent()
    // Keep processing messages until no data available.
    while (serialInputBuffer.TakeFromSerial())
    {
+     DEBUG("z m_dataDigitCount="); DEBUGln(serialInputBuffer.m_dataDigitCount);
+DEBUG("z m_dataByteCount="); DEBUGln(serialInputBuffer.m_dataByteCount);
+DEBUG("z m_dataBuffer[0]="); DEBUGln(serialInputBuffer.m_dataBuffer[0]);
      // If the message is serial_sync, then respond on the serial port only and don't send over the radio.
      if (serialInputBuffer.m_dataBuffer[0] == REQUEST_SERIAL_SYNC && serialInputBuffer.m_dataByteCount == 1)
      {
        // keep a count for debugging.  Serial sync request should be infrequent.
+       DEBUGln("sync");
        g_serialSyncCount++;
      }
      else 
      {
+       
         // Send message over the radio. The serial number in the last byte was already removed from the data byte count.
         // Choosing to send over the radio *before* giving the sender the ok to send more data.  
         // This is because, if we spend too long inside radio.send, then the internal serial input buffer can overflow.
