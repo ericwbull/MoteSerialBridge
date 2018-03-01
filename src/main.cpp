@@ -26,6 +26,7 @@
 // Please maintain this license information along with authorship
 // and copyright notices in any redistribution of this code
 // **********************************************************************************
+//#include <LowPower.h> //get library from: https://github.com/lowpowerlab/lowpower
 #include <RFM69.h>         //get it here: https://www.github.com/lowpowerlab/rfm69
 #include <RFM69_ATC.h>     //get it here: https://www.github.com/lowpowerlab/rfm69
 #include <SPIFlash.h>      //get it here: https://www.github.com/lowpowerlab/spiflash
@@ -81,10 +82,19 @@
 #define DEBUGFlush();
 #endif
 
+#define BATTERY_SAMPLE_INTERVAL_MS 100
+#define BATTERY_TRANSMIT_INTERVAL_MS 5000
+
 #define GATEWAYID 1
 
 SPIFlash flash(FLASH_SS, 0xEF30); //EF30 for 4mbit  Windbond chip (W25X40CL)
 bool promiscuousMode = false; //set to 'true' to sniff all packets on the same network
+
+void printDataAsHex(uint8_t* dataBuffer, int len);
+void mySerialEvent();
+void Blink(byte PIN, int DELAY_MS);
+void XmitBatteryStatus();
+void SampleBatteryStatus();
 
 class SerialInputBuffer
 {
@@ -257,12 +267,100 @@ class SerialInputBuffer
     }
 };
 
+
+class RecurringEventManager
+{
+  public:
+
+  enum Event
+  {
+    EVENT_BATT_XMIT = 0,
+    EVENT_BATT_SAMPLE = 1,
+    EVENT_COUNT
+  };
+
+  struct EventStatus
+  {
+public:
+    EventStatus(unsigned short intervalMS, void (*m_actionPtr)())
+    {
+      m_intervalMS = intervalMS;
+    }
+
+    void start(unsigned long now)
+    {
+      m_time = now + m_intervalMS;
+    }
+
+    bool testAndReset(unsigned long now)
+    {
+      bool signal = false;
+      if (now > m_time)
+      {
+        signal = true;
+      }
+      m_time = now + m_intervalMS;
+      return signal;
+    }
+
+    // the time when the event will be signaled next
+    unsigned long m_time;
+
+    // the millisecond interval between occurrences
+    unsigned short m_intervalMS;
+
+    // the event action
+    void (*m_actionPtr)();
+
+    EventStatus()
+    {
+    }
+  };
+
+  EventStatus m_status[EVENT_COUNT];
+
+  // the current time as given by the last call to startAll or doAll.
+  unsigned long m_now;
+
+  void startAll(unsigned long now)
+  {
+//    m_now = now;
+    for (int i = 0; i < EVENT_COUNT; i++)
+    {
+      m_status[i].start(now);
+    }
+  }
+
+  void doAll(unsigned long now)
+  {
+//    m_now = now;
+    for (int i = 0; i < EVENT_COUNT; i++)
+    {
+      if (m_status[i].testAndReset(now))
+      {
+        (*m_status[i].m_actionPtr)();
+      }
+    }
+  }
+
+//  unsigned long getTimeNow()
+//  {
+//    return m_now;
+//  }
+
+  RecurringEventManager()
+  {
+    m_status[EVENT_BATT_XMIT] = EventStatus(BATTERY_SAMPLE_INTERVAL_MS, XmitBatteryStatus);
+    m_status[EVENT_BATT_SAMPLE] = EventStatus(BATTERY_SAMPLE_INTERVAL_MS, SampleBatteryStatus); 
+  }
+};
+
 SerialInputBuffer serialInputBuffer;
+RecurringEventManager eventManager;
+unsigned long g_now;
 
-
-
-unsigned long timeOfNextPowerMessage;
 Adafruit_INA219 ina219;
+
 void setup() {
   ina219.begin(); 
   Serial.begin(SERIAL_BAUD);
@@ -281,16 +379,19 @@ void setup() {
 
   if (flash.initialize())
   {
-
-    DEBUG("SPI Flash Init OK. Unique MAC = [");
- 
-    flash.readUniqueId();
-    for (byte i=0;i<8;i++)
-    {
-      DEBUG2(flash.UNIQUEID[i], HEX);
-      if (i!=8) DEBUG(':');
-    }
-    DEBUGln(']');
+      flash.sleep(); // if Moteino has FLASH-MEM, make sure it sleeps
+  }
+//  {
+//
+//    DEBUG("SPI Flash Init OK. Unique MAC = [");
+// 
+//    flash.readUniqueId();
+//    for (byte i=0;i<8;i++)
+//    {
+//      DEBUG2(flash.UNIQUEID[i], HEX);
+//      if (i!=8) DEBUG(':');
+//    }
+//    DEBUGln(']');
     
     //alternative way to read it:
     //byte* MAC = flash.readUniqueId();
@@ -299,38 +400,20 @@ void setup() {
     //  DEBUG(MAC[i], HEX);
     //  DEBUG(' ');
     //}
-  }
-  else
-    DEBUGln("SPI Flash MEM not found (is chip soldered?)...");
+  //}
+  //else
+  //  DEBUGln("SPI Flash MEM not found (is chip soldered?)...");
     
 #ifdef ENABLE_ATC
   DEBUGln("RFM69_ATC Enabled (Auto Transmission Control)");
 #endif
-    timeOfNextPowerMessage=millis()+5000;
+
+  g_now = millis();
+  eventManager.startAll(g_now);
 }
-
-void Blink(byte PIN, int DELAY_MS);
-
-
-byte ackCount=0;
-uint32_t packetCount = 0;
-
-void printDataAsHex(uint8_t* dataBuffer, int len)
-{
-    for(int i = 0; i < len; ++i)
-    {
-      char twoChar[3];
-
-      sprintf(twoChar, "%02x", dataBuffer[i]);
-      Serial.print(twoChar);
-    }
-}
-
-void mySerialEvent();
 
 void loop() {
-
-  unsigned long time = millis();
+  
   mySerialEvent();
 
   // Data received from the radio gets delivered to Serial as 
@@ -349,24 +432,24 @@ void loop() {
   // Process any available serial input before doing other things that might take some time.
   mySerialEvent();
 
-  if (time > timeOfNextPowerMessage)
-  { 
-    float busvoltage = 0;  
-    float current_mA = 0;   
-    busvoltage = ina219.getBusVoltage_V();  
-    current_mA = ina219.getCurrent_mA();  
+  //time = time + 2000 + millis() - now;
+//  LowPower.idle(SLEEP_2S, ADC_OFF, TIMER2_OFF, TIMER1_OFF, TIMER0_ON, 
+//                SPI_OFF, USART0_ON, TWI_OFF);
 
-    char buff[62];
-    char busVStr[6] = "     ";
-    char currentStr[6] = "     ";
-    dtostrf((double)busvoltage,5,3,busVStr);
-    dtostrf((double)current_mA/1000.0,5,3,currentStr);
+  eventManager.doAll(g_now);
 
-    sprintf(buff, STREAM_ID_INFO_STR "V:%s A:%s", busVStr, currentStr);
-        // send over radio
-    radio.send(GATEWAYID, buff, strlen(buff));
-    timeOfNextPowerMessage = time + 60000;
-  }
+  g_now = millis();
+}
+
+void printDataAsHex(uint8_t* dataBuffer, int len)
+{
+    for(int i = 0; i < len; ++i)
+    {
+      char twoChar[3];
+
+      sprintf(twoChar, "%02x", dataBuffer[i]);
+      Serial.print(twoChar);
+    }
 }
 
 void Blink(byte PIN, int DELAY_MS)
@@ -428,4 +511,129 @@ DEBUG("z m_dataBuffer[0]="); DEBUGln(serialInputBuffer.m_dataBuffer[0]);
    }
 
   digitalWrite(LED,LOW);
+}
+
+//---------------------------------------------------------------------------------------------------
+//  POWER MONITORING
+//---------------------------------------------------------------------------------------------------
+class MinMaxAvg
+{
+public:
+    MinMaxAvg(float weightOfMostRecent)
+    : m_min(0)
+    , m_max(0)
+    , m_EWMAverage(0)
+    , m_noPreviousInput(true)
+    {
+      m_weightOfRecent = weightOfMostRecent;
+      m_weightOfHistory = 1-weightOfMostRecent;
+    }
+
+    float m_weightOfRecent;
+    float m_weightOfHistory;
+    float m_min;
+    float m_max;
+    /// Exponential weighted moving average
+    float m_EWMAverage;
+    bool m_noPreviousInput;
+
+    char m_minStr[6];
+    char m_maxStr[6];
+    char m_avgStr[6];
+
+    void input(float d)
+    {
+      if (m_noPreviousInput)
+      {
+        m_min = d;
+        m_max = d;
+        m_EWMAverage = d;
+        m_noPreviousInput = false;
+      }
+      else
+      {
+        if (m_max < d)
+        {
+          m_max = d;
+        }
+        if (m_min > d)
+        {
+          m_min = d;
+        }
+
+        m_EWMAverage = m_weightOfRecent * d + m_weightOfHistory * m_EWMAverage;
+      }
+    }
+
+    void reset()
+    {
+      m_noPreviousInput = true;
+    }
+
+    static char* toString(char* buf, float val, double scalar)
+    {
+      memset(buf, 0, 6);
+      dtostrf((double)val*scalar, 5, 3, buf);
+      return buf;
+    }
+
+    char* minToString(double scalar = 1.0)
+    {
+      return toString(m_minStr, m_min, scalar);
+    }
+
+    char* maxToString(double scalar = 1.0)
+    {
+      return toString(m_maxStr, m_max, scalar);
+    }
+
+    char* avgToString(double scalar = 1.0)
+    {
+      return toString(m_avgStr, m_EWMAverage, scalar);
+    }
+};
+
+class PowerMonitor
+{
+  public:
+    MinMaxAvg m_busVoltage;
+    MinMaxAvg m_current_mA;
+
+  PowerMonitor()
+  : m_busVoltage(0.2)
+  , m_current_mA(0.2)
+  {
+  }
+
+  void sample()
+  {
+    float v = ina219.getBusVoltage_V();  
+    float mA = ina219.getCurrent_mA();  
+
+    m_busVoltage.input(v);
+    m_current_mA.input(mA);
+  }
+};
+
+PowerMonitor g_battery;
+
+void XmitBatteryStatus()
+{
+    MinMaxAvg& busV = g_battery.m_busVoltage;
+    MinMaxAvg& mA = g_battery.m_current_mA;
+
+    char buff[62];
+    sprintf(buff, STREAM_ID_INFO_STR "VMIN:%s AMIN:%s VMAX:%s AMAX:%s", 
+        busV.minToString(), mA.minToString(1.0/1000.0),
+        busV.maxToString(), mA.maxToString(1.0/1000.0)
+        );
+    radio.send(GATEWAYID, buff, strlen(buff));
+
+    sprintf(buff, STREAM_ID_INFO_STR "V:%s A:%s", busV.avgToString(), mA.avgToString(1.0/1000.0));
+    radio.send(GATEWAYID, buff, strlen(buff));
+}
+
+void SampleBatteryStatus()
+{
+  g_battery.sample();
 }
