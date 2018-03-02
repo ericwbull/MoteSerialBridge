@@ -69,7 +69,7 @@
   RFM69 radio;
 #endif
 
-#undef SERIAL_EN
+#define SERIAL_EN
 #ifdef SERIAL_EN
 #define DEBUG2(input1,input2) {Serial.print(input1,input2);}
 #define DEBUG(input)   {Serial.print(input); delay(1);}
@@ -83,7 +83,7 @@
 #endif
 
 #define BATTERY_SAMPLE_INTERVAL_MS 100
-#define BATTERY_TRANSMIT_INTERVAL_MS 5000
+#define BATTERY_TRANSMIT_INTERVAL_MS 60000
 
 #define GATEWAYID 1
 
@@ -93,8 +93,6 @@ bool promiscuousMode = false; //set to 'true' to sniff all packets on the same n
 void printDataAsHex(uint8_t* dataBuffer, int len);
 void mySerialEvent();
 void Blink(byte PIN, int DELAY_MS);
-void XmitBatteryStatus();
-void SampleBatteryStatus();
 
 class SerialInputBuffer
 {
@@ -268,251 +266,6 @@ class SerialInputBuffer
 };
 
 
-class RecurringEventManager
-{
-  public:
-
-  enum Event
-  {
-    EVENT_BATT_XMIT = 0,
-    EVENT_BATT_SAMPLE = 1,
-    EVENT_COUNT
-  };
-
-  struct EventStatus
-  {
-public:
-    EventStatus(unsigned short intervalMS, void (*m_actionPtr)())
-    {
-      m_intervalMS = intervalMS;
-    }
-
-    void start(unsigned long now)
-    {
-      m_time = now + m_intervalMS;
-    }
-
-    bool testAndReset(unsigned long now)
-    {
-      bool signal = false;
-      if (now > m_time)
-      {
-        signal = true;
-      }
-      m_time = now + m_intervalMS;
-      return signal;
-    }
-
-    // the time when the event will be signaled next
-    unsigned long m_time;
-
-    // the millisecond interval between occurrences
-    unsigned short m_intervalMS;
-
-    // the event action
-    void (*m_actionPtr)();
-
-    EventStatus()
-    {
-    }
-  };
-
-  EventStatus m_status[EVENT_COUNT];
-
-  // the current time as given by the last call to startAll or doAll.
-  unsigned long m_now;
-
-  void startAll(unsigned long now)
-  {
-//    m_now = now;
-    for (int i = 0; i < EVENT_COUNT; i++)
-    {
-      m_status[i].start(now);
-    }
-  }
-
-  void doAll(unsigned long now)
-  {
-//    m_now = now;
-    for (int i = 0; i < EVENT_COUNT; i++)
-    {
-      if (m_status[i].testAndReset(now))
-      {
-        (*m_status[i].m_actionPtr)();
-      }
-    }
-  }
-
-//  unsigned long getTimeNow()
-//  {
-//    return m_now;
-//  }
-
-  RecurringEventManager()
-  {
-    m_status[EVENT_BATT_XMIT] = EventStatus(BATTERY_SAMPLE_INTERVAL_MS, XmitBatteryStatus);
-    m_status[EVENT_BATT_SAMPLE] = EventStatus(BATTERY_SAMPLE_INTERVAL_MS, SampleBatteryStatus); 
-  }
-};
-
-SerialInputBuffer serialInputBuffer;
-RecurringEventManager eventManager;
-unsigned long g_now;
-
-Adafruit_INA219 ina219;
-
-void setup() {
-  ina219.begin(); 
-  Serial.begin(SERIAL_BAUD);
-  delay(10);
-  radio.initialize(FREQUENCY,NODEID,NETWORKID);
-#ifdef IS_RFM69HW_HCW
-  radio.setHighPower(); //must include this only for RFM69HW/HCW!
-#endif
-  radio.encrypt(ENCRYPTKEY);
-  radio.promiscuous(promiscuousMode);
-  //radio.setFrequency(919000000); //set frequency to some custom frequency
-  char buff[50];
-
-  sprintf(buff, "\nListening at %d Mhz...", FREQUENCY==RF69_433MHZ ? 433 : FREQUENCY==RF69_868MHZ ? 868 : 915);
-  DEBUGln(buff);
-
-  if (flash.initialize())
-  {
-      flash.sleep(); // if Moteino has FLASH-MEM, make sure it sleeps
-  }
-//  {
-//
-//    DEBUG("SPI Flash Init OK. Unique MAC = [");
-// 
-//    flash.readUniqueId();
-//    for (byte i=0;i<8;i++)
-//    {
-//      DEBUG2(flash.UNIQUEID[i], HEX);
-//      if (i!=8) DEBUG(':');
-//    }
-//    DEBUGln(']');
-    
-    //alternative way to read it:
-    //byte* MAC = flash.readUniqueId();
-    //for (byte i=0;i<8;i++)
-    //{
-    //  DEBUG(MAC[i], HEX);
-    //  DEBUG(' ');
-    //}
-  //}
-  //else
-  //  DEBUGln("SPI Flash MEM not found (is chip soldered?)...");
-    
-#ifdef ENABLE_ATC
-  DEBUGln("RFM69_ATC Enabled (Auto Transmission Control)");
-#endif
-
-  g_now = millis();
-  eventManager.startAll(g_now);
-}
-
-void loop() {
-  
-  mySerialEvent();
-
-  // Data received from the radio gets delivered to Serial as 
-  // hexidecimal 2 chars per byte no spaces, followed by EOL.
-  if (radio.receiveDone())
-  {
-    printDataAsHex((uint8_t*)radio.DATA, radio.DATALEN);
-    Serial.print('\n');
-
-    if (radio.ACKRequested())
-    {
-      radio.sendACK();
-    }
-  }
-
-  // Process any available serial input before doing other things that might take some time.
-  mySerialEvent();
-
-  //time = time + 2000 + millis() - now;
-//  LowPower.idle(SLEEP_2S, ADC_OFF, TIMER2_OFF, TIMER1_OFF, TIMER0_ON, 
-//                SPI_OFF, USART0_ON, TWI_OFF);
-
-  eventManager.doAll(g_now);
-
-  g_now = millis();
-}
-
-void printDataAsHex(uint8_t* dataBuffer, int len)
-{
-    for(int i = 0; i < len; ++i)
-    {
-      char twoChar[3];
-
-      sprintf(twoChar, "%02x", dataBuffer[i]);
-      Serial.print(twoChar);
-    }
-}
-
-void Blink(byte PIN, int DELAY_MS)
-{
-  pinMode(PIN, OUTPUT);
-  digitalWrite(PIN,HIGH);
-  delay(DELAY_MS);
-  digitalWrite(PIN,LOW);
-}
-
-const int REQUEST_SERIAL_SYNC = 13;
-const int RETURN_SERIAL_SYNC = 12;
-
-void SendSerialSyncResponse(uint8_t serialNumber)
-{
-  uint8_t data[2];
-  data[0] = RETURN_SERIAL_SYNC;
-  data[1] = serialNumber;
-  printDataAsHex(data, 2);
-  Serial.print('\n');
-}
-
-// For debug.  TODO add this to a status message sent over the radio.
-uint32_t g_serialSyncCount = 0;
-
-void mySerialEvent()
-{
-   if (Serial.available())
-   {
-      pinMode(LED, OUTPUT);
-      digitalWrite(LED,HIGH);
-   }
-
-   // Keep processing messages until no data available.
-   while (serialInputBuffer.TakeFromSerial())
-   {
-     DEBUG("z m_dataDigitCount="); DEBUGln(serialInputBuffer.m_dataDigitCount);
-DEBUG("z m_dataByteCount="); DEBUGln(serialInputBuffer.m_dataByteCount);
-DEBUG("z m_dataBuffer[0]="); DEBUGln(serialInputBuffer.m_dataBuffer[0]);
-     // If the message is serial_sync, then respond on the serial port only and don't send over the radio.
-     if (serialInputBuffer.m_dataBuffer[0] == REQUEST_SERIAL_SYNC && serialInputBuffer.m_dataByteCount == 1)
-     {
-       // keep a count for debugging.  Serial sync request should be infrequent.
-       DEBUGln("sync");
-       g_serialSyncCount++;
-     }
-     else 
-     {
-       
-        // Send message over the radio. The serial number in the last byte was already removed from the data byte count.
-        // Choosing to send over the radio *before* giving the sender the ok to send more data.  
-        // This is because, if we spend too long inside radio.send, then the internal serial input buffer can overflow.
-        radio.send(GATEWAYID, serialInputBuffer.m_dataBuffer, serialInputBuffer.m_dataByteCount);
-
-     }
-     // Tell the sender that we are done and therefore ok to send more.
-     // Serial sync response is always sent.
-     SendSerialSyncResponse(serialInputBuffer.m_lastDataByte);
-   }
-
-  digitalWrite(LED,LOW);
-}
-
 //---------------------------------------------------------------------------------------------------
 //  POWER MONITORING
 //---------------------------------------------------------------------------------------------------
@@ -595,6 +348,8 @@ public:
 
 class PowerMonitor
 {
+  Adafruit_INA219 m_ina219;
+
   public:
     MinMaxAvg m_busVoltage;
     MinMaxAvg m_current_mA;
@@ -603,24 +358,89 @@ class PowerMonitor
   : m_busVoltage(0.2)
   , m_current_mA(0.2)
   {
+
+  }
+
+  void setup()
+  {
+    m_ina219.begin();
   }
 
   void sample()
   {
-    float v = ina219.getBusVoltage_V();  
-    float mA = ina219.getCurrent_mA();  
+    float v = m_ina219.getBusVoltage_V();  
+    float mA = m_ina219.getCurrent_mA();  
 
     m_busVoltage.input(v);
     m_current_mA.input(mA);
   }
 };
 
-PowerMonitor g_battery;
-
-void XmitBatteryStatus()
+class RecurringAction
 {
-    MinMaxAvg& busV = g_battery.m_busVoltage;
-    MinMaxAvg& mA = g_battery.m_current_mA;
+public:
+    RecurringAction(unsigned short intervalMS)
+    {
+      m_intervalMS = intervalMS;
+    }
+
+    virtual void doAction()
+    {}
+
+    void startTimer(unsigned long now)
+    {
+      DEBUG("start");
+      m_time = now + m_intervalMS;
+      DEBUG(now); DEBUG(" "); DEBUGln(m_time);
+      m_started = true;
+    } 
+
+    void doActionIfTime(unsigned long now)
+    {
+        if (!m_started)
+        {
+          startTimer(now);
+        }
+        else
+        {
+          if (now > m_time)
+          {
+            doAction();
+            startTimer(now);
+          }
+        }
+    }
+
+    // the time when the event will be signaled next
+    unsigned long m_time;
+
+    // the millisecond interval between occurrences
+    unsigned short m_intervalMS;
+    bool m_started;
+
+    RecurringAction()
+    {
+      m_started = false;
+    }
+};
+
+
+class XmitBatteryStatus: public RecurringAction
+{
+  PowerMonitor& m_pm;
+
+  public:
+
+  XmitBatteryStatus(PowerMonitor&pm)
+  : RecurringAction(BATTERY_TRANSMIT_INTERVAL_MS)
+  , m_pm(pm)
+  {}
+
+  virtual void doAction()
+  {
+ DEBUGln("XmitBatteryStatus");
+    MinMaxAvg& busV = m_pm.m_busVoltage;
+    MinMaxAvg& mA = m_pm.m_current_mA;
 
     char buff[62];
     sprintf(buff, STREAM_ID_INFO_STR "VMIN:%s AMIN:%s VMAX:%s AMAX:%s", 
@@ -631,9 +451,236 @@ void XmitBatteryStatus()
 
     sprintf(buff, STREAM_ID_INFO_STR "V:%s A:%s", busV.avgToString(), mA.avgToString(1.0/1000.0));
     radio.send(GATEWAYID, buff, strlen(buff));
+
+    busV.reset();
+    mA.reset();
+  }
+};
+
+
+class SampleBatteryStatus: public RecurringAction
+{
+  PowerMonitor& m_pm;
+
+  public:
+    SampleBatteryStatus(PowerMonitor& pm)
+  : RecurringAction(BATTERY_SAMPLE_INTERVAL_MS)
+  , m_pm(pm)
+  {}
+
+  virtual void doAction()
+  {
+    m_pm.sample();
+  }
+};
+
+
+class RecurringActionManager
+{
+  public:
+
+  enum Constants
+  {
+    MAX_ACTION_COUNT = 5
+  };
+
+  int m_count;
+
+  RecurringAction* m_actions[MAX_ACTION_COUNT] = {0};
+
+  void doAll(unsigned long now)
+  {
+    for (int i = 0; i < m_count; i++)
+    {
+      RecurringAction* a = m_actions[i];
+      
+      if (0 == a)
+        continue;
+
+      a->doActionIfTime(now); 
+    }
+  }
+  void add(RecurringAction* a)
+  {
+    if (m_count < MAX_ACTION_COUNT)
+    {
+       m_actions[m_count++] = a;
+    }
+  }
+//  unsigned long getTimeNow()
+//  {
+//    return m_now;
+//  }
+    
+  RecurringActionManager()
+  {
+    m_count = 0;
+
+  }
+};
+
+
+PowerMonitor m_battery;
+XmitBatteryStatus batteryXmit(m_battery);
+SampleBatteryStatus sampleBattery(m_battery);
+
+SerialInputBuffer serialInputBuffer;
+RecurringActionManager timeTriggeredEvents;
+unsigned long g_now;
+
+void setup() {
+  Serial.begin(SERIAL_BAUD);
+  delay(10);
+  radio.initialize(FREQUENCY,NODEID,NETWORKID);
+#ifdef IS_RFM69HW_HCW
+  radio.setHighPower(); //must include this only for RFM69HW/HCW!
+#endif
+  radio.encrypt(ENCRYPTKEY);
+  radio.promiscuous(promiscuousMode);
+  //radio.setFrequency(919000000); //set frequency to some custom frequency
+  char buff[50];
+
+  sprintf(buff, "\nListening at %d Mhz...", FREQUENCY==RF69_433MHZ ? 433 : FREQUENCY==RF69_868MHZ ? 868 : 915);
+  DEBUGln(buff);
+
+  if (flash.initialize())
+  {
+      flash.sleep(); // if Moteino has FLASH-MEM, make sure it sleeps
+  }
+//  {
+//
+//    DEBUG("SPI Flash Init OK. Unique MAC = [");
+// 
+//    flash.readUniqueId();
+//    for (byte i=0;i<8;i++)
+//    {
+//      DEBUG2(flash.UNIQUEID[i], HEX);
+//      if (i!=8) DEBUG(':');
+//    }
+//    DEBUGln(']');
+    
+    //alternative way to read it:
+    //byte* MAC = flash.readUniqueId();
+    //for (byte i=0;i<8;i++)
+    //{
+    //  DEBUG(MAC[i], HEX);
+    //  DEBUG(' ');
+    //}
+  //}
+  //else
+  //  DEBUGln("SPI Flash MEM not found (is chip soldered?)...");
+    
+#ifdef ENABLE_ATC
+  DEBUGln("RFM69_ATC Enabled (Auto Transmission Control)");
+#endif
+
+  m_battery.setup();
+
+  timeTriggeredEvents.add(&batteryXmit);
+  timeTriggeredEvents.add(&sampleBattery);
+
+   g_now = millis();
 }
 
-void SampleBatteryStatus()
-{
-  g_battery.sample();
+void loop() {
+  
+  mySerialEvent();
+
+  // Data received from the radio gets delivered to Serial as 
+  // hexidecimal 2 chars per byte no spaces, followed by EOL.
+  if (radio.receiveDone())
+  {
+    printDataAsHex((uint8_t*)radio.DATA, radio.DATALEN);
+    Serial.print('\n');
+
+    if (radio.ACKRequested())
+    {
+      radio.sendACK();
+    }
+  }
+
+  // Process any available serial input before doing other things that might take some time.
+  mySerialEvent();
+
+  //time = time + 2000 + millis() - now;
+//  LowPower.idle(SLEEP_2S, ADC_OFF, TIMER2_OFF, TIMER1_OFF, TIMER0_ON, 
+//                SPI_OFF, USART0_ON, TWI_OFF);
+
+  timeTriggeredEvents.doAll(g_now);
+
+  g_now = millis();
 }
+
+void printDataAsHex(uint8_t* dataBuffer, int len)
+{
+    for(int i = 0; i < len; ++i)
+    {
+      char twoChar[3];
+
+      sprintf(twoChar, "%02x", dataBuffer[i]);
+      Serial.print(twoChar);
+    }
+}
+
+void Blink(byte PIN, int DELAY_MS)
+{
+  pinMode(PIN, OUTPUT);
+  digitalWrite(PIN,HIGH);
+  delay(DELAY_MS);
+  digitalWrite(PIN,LOW);
+}
+
+const int REQUEST_SERIAL_SYNC = 13;
+const int RETURN_SERIAL_SYNC = 12;
+
+void SendSerialSyncResponse(uint8_t serialNumber)
+{
+  uint8_t data[2];
+  data[0] = RETURN_SERIAL_SYNC;
+  data[1] = serialNumber;
+  printDataAsHex(data, 2);
+  Serial.print('\n');
+}
+
+// For debug.  TODO add this to a status message sent over the radio.
+uint32_t g_serialSyncCount = 0;
+
+void mySerialEvent()
+{
+   if (Serial.available())
+   {
+      pinMode(LED, OUTPUT);
+      digitalWrite(LED,HIGH);
+   }
+
+   // Keep processing messages until no data available.
+   while (serialInputBuffer.TakeFromSerial())
+   {
+     DEBUG("z m_dataDigitCount="); DEBUGln(serialInputBuffer.m_dataDigitCount);
+DEBUG("z m_dataByteCount="); DEBUGln(serialInputBuffer.m_dataByteCount);
+DEBUG("z m_dataBuffer[0]="); DEBUGln(serialInputBuffer.m_dataBuffer[0]);
+     // If the message is serial_sync, then respond on the serial port only and don't send over the radio.
+     if (serialInputBuffer.m_dataBuffer[0] == REQUEST_SERIAL_SYNC && serialInputBuffer.m_dataByteCount == 1)
+     {
+       // keep a count for debugging.  Serial sync request should be infrequent.
+       DEBUGln("sync");
+       g_serialSyncCount++;
+     }
+     else 
+     {
+       
+        // Send message over the radio. The serial number in the last byte was already removed from the data byte count.
+        // Choosing to send over the radio *before* giving the sender the ok to send more data.  
+        // This is because, if we spend too long inside radio.send, then the internal serial input buffer can overflow.
+        radio.send(GATEWAYID, serialInputBuffer.m_dataBuffer, serialInputBuffer.m_dataByteCount);
+
+     }
+     // Tell the sender that we are done and therefore ok to send more.
+     // Serial sync response is always sent.
+     SendSerialSyncResponse(serialInputBuffer.m_lastDataByte);
+   }
+
+  digitalWrite(LED,LOW);
+}
+
+
