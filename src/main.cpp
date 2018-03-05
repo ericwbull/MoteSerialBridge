@@ -26,7 +26,9 @@
 // Please maintain this license information along with authorship
 // and copyright notices in any redistribution of this code
 // **********************************************************************************
-//#include <LowPower.h> //get library from: https://github.com/lowpowerlab/lowpower
+//#include <avr/power.h>
+//#include <avr/sleep.h>
+#include <LowPower.h> //get library from: https://github.com/lowpowerlab/lowpower
 #include <RFM69.h>         //get it here: https://www.github.com/lowpowerlab/rfm69
 #include <RFM69_ATC.h>     //get it here: https://www.github.com/lowpowerlab/rfm69
 #include <SPIFlash.h>      //get it here: https://www.github.com/lowpowerlab/spiflash
@@ -79,11 +81,13 @@
 #define DEBUG2(input1,input2);
 #define DEBUG(input);
 #define DEBUGln(input);
+
+
 #define DEBUGFlush();
 #endif
 
 #define BATTERY_SAMPLE_INTERVAL_MS 100
-#define BATTERY_TRANSMIT_INTERVAL_MS 60000
+#define BATTERY_TRANSMIT_INTERVAL_MS 120000
 
 #define GATEWAYID 1
 
@@ -379,7 +383,7 @@ class PowerMonitor
 class RecurringAction
 {
 public:
-    RecurringAction(unsigned short intervalMS)
+    RecurringAction(unsigned long intervalMS)
     {
       m_intervalMS = intervalMS;
     }
@@ -415,7 +419,7 @@ public:
     unsigned long m_time;
 
     // the millisecond interval between occurrences
-    unsigned short m_intervalMS;
+    unsigned long m_intervalMS;
     bool m_started;
 
     RecurringAction()
@@ -431,7 +435,7 @@ class XmitBatteryStatus: public RecurringAction
 
   public:
 
-  XmitBatteryStatus(PowerMonitor&pm)
+  XmitBatteryStatus(PowerMonitor& pm)
   : RecurringAction(BATTERY_TRANSMIT_INTERVAL_MS)
   , m_pm(pm)
   {}
@@ -447,10 +451,11 @@ class XmitBatteryStatus: public RecurringAction
         busV.minToString(), mA.minToString(1.0/1000.0),
         busV.maxToString(), mA.maxToString(1.0/1000.0)
         );
-    radio.send(GATEWAYID, buff, strlen(buff));
+    radio.sendWithRetry(GATEWAYID, buff, strlen(buff));
 
     sprintf(buff, STREAM_ID_INFO_STR "V:%s A:%s", busV.avgToString(), mA.avgToString(1.0/1000.0));
-    radio.send(GATEWAYID, buff, strlen(buff));
+    DEBUGln(buff);
+    radio.sendWithRetry(GATEWAYID, buff, strlen(buff));
 
     busV.reset();
     mA.reset();
@@ -527,6 +532,7 @@ SampleBatteryStatus sampleBattery(m_battery);
 SerialInputBuffer serialInputBuffer;
 RecurringActionManager timeTriggeredEvents;
 unsigned long g_now;
+bool g_sleep = false;
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
@@ -580,16 +586,38 @@ void setup() {
   timeTriggeredEvents.add(&sampleBattery);
 
    g_now = millis();
+   g_sleep = false;
 }
 
+void sleep()
+{
+
+  DEBUGln( "sleeping\n" );
+  DEBUGFlush();
+//time = time + 2000 + millis() - now;
+
+// IMPORTANT to sleep radio before going idle.  If the radio receives something during idle, then receiveDone hangs after wakeup. 
+  radio.sleep();  
+  LowPower.idle(SLEEP_8S, ADC_OFF, TIMER2_OFF, TIMER1_OFF, TIMER0_OFF, 
+                SPI_OFF, USART0_ON, TWI_OFF);
+
+//  set_sleep_mode( SLEEP_MODE_IDLE );
+//  power_all_disable();
+//  power_usart0_enable();
+//  sleep_mode();
+//  power_all_enable();
+  DEBUGln( "awake" );
+}
 void loop() {
   
   mySerialEvent();
 
+  //bool rd = radio.receiveDone()
   // Data received from the radio gets delivered to Serial as 
   // hexidecimal 2 chars per byte no spaces, followed by EOL.
   if (radio.receiveDone())
   {
+    DEBUG("datalen:");DEBUGln(radio.DATALEN);
     printDataAsHex((uint8_t*)radio.DATA, radio.DATALEN);
     Serial.print('\n');
 
@@ -602,12 +630,14 @@ void loop() {
   // Process any available serial input before doing other things that might take some time.
   mySerialEvent();
 
-  //time = time + 2000 + millis() - now;
-//  LowPower.idle(SLEEP_2S, ADC_OFF, TIMER2_OFF, TIMER1_OFF, TIMER0_ON, 
-//                SPI_OFF, USART0_ON, TWI_OFF);
 
   timeTriggeredEvents.doAll(g_now);
 
+  if (g_sleep)
+  {
+    // sleep is not working
+    sleep();
+  }
   g_now = millis();
 }
 
@@ -632,6 +662,8 @@ void Blink(byte PIN, int DELAY_MS)
 
 const int REQUEST_SERIAL_SYNC = 13;
 const int RETURN_SERIAL_SYNC = 12;
+const int RETURN_STATUS = 14;
+const int NOTIFY_SLEEP = 16;
 
 void SendSerialSyncResponse(uint8_t serialNumber)
 {
@@ -666,13 +698,36 @@ DEBUG("z m_dataBuffer[0]="); DEBUGln(serialInputBuffer.m_dataBuffer[0]);
        DEBUGln("sync");
        g_serialSyncCount++;
      }
-     else 
+     else if (serialInputBuffer.m_dataBuffer[0] == NOTIFY_SLEEP && serialInputBuffer.m_dataByteCount == 2 )
      {
-       
+        if (serialInputBuffer.m_dataBuffer[1])
+        {
+          DEBUGln("sleep on");
+          g_sleep = true;
+        }
+        else
+        {
+          DEBUGln("sleep off");
+          g_sleep = false;
+        }
+     }
+    else 
+    {
+
+        // If the message is a status message, then send the battery status also.
+        if (serialInputBuffer.m_dataBuffer[0] == RETURN_STATUS)
+        {
+         sampleBattery.doAction();
+         batteryXmit.doAction();
+
+         // Disable sleep whenever status is sent.  The radio doesn't receive when sleeping.
+         // So we need the radio to be awake at a predictable time for the gateway to send messages.
+         g_sleep = false;
+        }
         // Send message over the radio. The serial number in the last byte was already removed from the data byte count.
         // Choosing to send over the radio *before* giving the sender the ok to send more data.  
         // This is because, if we spend too long inside radio.send, then the internal serial input buffer can overflow.
-        radio.send(GATEWAYID, serialInputBuffer.m_dataBuffer, serialInputBuffer.m_dataByteCount);
+        radio.sendWithRetry(GATEWAYID, serialInputBuffer.m_dataBuffer, serialInputBuffer.m_dataByteCount);
 
      }
      // Tell the sender that we are done and therefore ok to send more.
