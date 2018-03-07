@@ -71,7 +71,7 @@
   RFM69 radio;
 #endif
 
-#define SERIAL_EN
+#undef SERIAL_EN
 #ifdef SERIAL_EN
 #define DEBUG2(input1,input2) {Serial.print(input1,input2);}
 #define DEBUG(input)   {Serial.print(input); delay(1);}
@@ -86,14 +86,16 @@
 #define DEBUGFlush();
 #endif
 
-#define BATTERY_SAMPLE_INTERVAL_MS 100
+#define BATTERY_SAMPLE_INTERVAL_MS 2000
 #define BATTERY_TRANSMIT_INTERVAL_MS 120000
+#define WAIT_FOR_RECEIVE_TIME_MS 10000
 
 #define GATEWAYID 1
 
 SPIFlash flash(FLASH_SS, 0xEF30); //EF30 for 4mbit  Windbond chip (W25X40CL)
 bool promiscuousMode = false; //set to 'true' to sniff all packets on the same network
 
+void sendToGateway(void* buffer, int byteCount);
 void printDataAsHex(uint8_t* dataBuffer, int len);
 void mySerialEvent();
 void Blink(byte PIN, int DELAY_MS);
@@ -451,11 +453,11 @@ class XmitBatteryStatus: public RecurringAction
         busV.minToString(), mA.minToString(1.0/1000.0),
         busV.maxToString(), mA.maxToString(1.0/1000.0)
         );
-    radio.sendWithRetry(GATEWAYID, buff, strlen(buff));
+    sendToGateway(buff, strlen(buff));
 
     sprintf(buff, STREAM_ID_INFO_STR "V:%s A:%s", busV.avgToString(), mA.avgToString(1.0/1000.0));
     DEBUGln(buff);
-    radio.sendWithRetry(GATEWAYID, buff, strlen(buff));
+    sendToGateway(buff, strlen(buff));
 
     busV.reset();
     mA.reset();
@@ -479,6 +481,32 @@ class SampleBatteryStatus: public RecurringAction
   }
 };
 
+// EnableSleepMode triggers every 100ms.
+// The system disables sleep mode when the radio transmits.
+// This action will reenable sleep mode after 100ms.
+// The action timer needs to be reset when sleep mode is disabled.
+class EnableSleepMode : public RecurringAction
+{
+  bool& m_sleepModeFlag;
+
+  public:
+  EnableSleepMode(bool& sleepModeFlag)
+  : RecurringAction(WAIT_FOR_RECEIVE_TIME_MS)
+  , m_sleepModeFlag(sleepModeFlag)
+  {
+  }
+
+  void reset()
+  {
+    startTimer(millis());
+    m_sleepModeFlag = false;
+  }
+
+  virtual void doAction()
+  {
+    m_sleepModeFlag = true;
+  }
+};
 
 class RecurringActionManager
 {
@@ -493,8 +521,9 @@ class RecurringActionManager
 
   RecurringAction* m_actions[MAX_ACTION_COUNT] = {0};
 
-  void doAll(unsigned long now)
+  void doAll()
   {
+    unsigned long now = millis();
     for (int i = 0; i < m_count; i++)
     {
       RecurringAction* a = m_actions[i];
@@ -526,13 +555,15 @@ class RecurringActionManager
 
 
 PowerMonitor m_battery;
+
+bool g_sleep = false;
+
+EnableSleepMode sleepMode(g_sleep);
 XmitBatteryStatus batteryXmit(m_battery);
 SampleBatteryStatus sampleBattery(m_battery);
 
 SerialInputBuffer serialInputBuffer;
 RecurringActionManager timeTriggeredEvents;
-unsigned long g_now;
-bool g_sleep = false;
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
@@ -584,9 +615,7 @@ void setup() {
 
   timeTriggeredEvents.add(&batteryXmit);
   timeTriggeredEvents.add(&sampleBattery);
-
-   g_now = millis();
-   g_sleep = false;
+  timeTriggeredEvents.add(&sleepMode);
 }
 
 void sleep()
@@ -600,7 +629,7 @@ void sleep()
   radio.sleep();  
   LowPower.idle(SLEEP_8S, ADC_OFF, TIMER2_OFF, TIMER1_OFF, TIMER0_OFF, 
                 SPI_OFF, USART0_ON, TWI_OFF);
-
+  
 //  set_sleep_mode( SLEEP_MODE_IDLE );
 //  power_all_disable();
 //  power_usart0_enable();
@@ -617,28 +646,33 @@ void loop() {
   // hexidecimal 2 chars per byte no spaces, followed by EOL.
   if (radio.receiveDone())
   {
-    DEBUG("datalen:");DEBUGln(radio.DATALEN);
-    printDataAsHex((uint8_t*)radio.DATA, radio.DATALEN);
-    Serial.print('\n');
+	// Copy the data from the radio before transmitting ACK.
+    uint8_t radioDataBuffer[70];
+    int radioDataLen = radio.DATALEN;
+    memcpy(radioDataBuffer,(void*)(&radio.DATA[0]),radioDataLen);
 
+	// Return ack as quickly as possible.
     if (radio.ACKRequested())
     {
       radio.sendACK();
-    }
+    }	
+	
+	// *AFTER* returning ack, process the received data.
+    DEBUG("datalen:");DEBUGln(radioDataLen);
+    printDataAsHex((uint8_t*)radioDataBuffer, radioDataLen);
+    Serial.print('\n');
   }
 
   // Process any available serial input before doing other things that might take some time.
   mySerialEvent();
 
 
-  timeTriggeredEvents.doAll(g_now);
+  timeTriggeredEvents.doAll();
 
   if (g_sleep)
   {
-    // sleep is not working
     sleep();
   }
-  g_now = millis();
 }
 
 void printDataAsHex(uint8_t* dataBuffer, int len)
@@ -698,37 +732,32 @@ DEBUG("z m_dataBuffer[0]="); DEBUGln(serialInputBuffer.m_dataBuffer[0]);
        DEBUGln("sync");
        g_serialSyncCount++;
      }
-     else if (serialInputBuffer.m_dataBuffer[0] == NOTIFY_SLEEP && serialInputBuffer.m_dataByteCount == 2 )
-     {
-        if (serialInputBuffer.m_dataBuffer[1])
-        {
-          DEBUGln("sleep on");
-          g_sleep = true;
-        }
-        else
-        {
-          DEBUGln("sleep off");
-          g_sleep = false;
-        }
-     }
+ //    else if (serialInputBuffer.m_dataBuffer[0] == NOTIFY_SLEEP && serialInputBuffer.m_dataByteCount == 2 )
+ //    {
+ //       if (serialInputBuffer.m_dataBuffer[1])
+ //       {
+ //         DEBUGln("sleep on");
+ //         g_sleep = true;
+//        }
+ //       else
+ //       {
+ //         DEBUGln("sleep off");
+ //         g_sleep = false;
+ //       }
+ //    }
     else 
     {
-
         // If the message is a status message, then send the battery status also.
         if (serialInputBuffer.m_dataBuffer[0] == RETURN_STATUS)
         {
          sampleBattery.doAction();
          batteryXmit.doAction();
-
-         // Disable sleep whenever status is sent.  The radio doesn't receive when sleeping.
-         // So we need the radio to be awake at a predictable time for the gateway to send messages.
-         g_sleep = false;
         }
         // Send message over the radio. The serial number in the last byte was already removed from the data byte count.
         // Choosing to send over the radio *before* giving the sender the ok to send more data.  
         // This is because, if we spend too long inside radio.send, then the internal serial input buffer can overflow.
-        radio.sendWithRetry(GATEWAYID, serialInputBuffer.m_dataBuffer, serialInputBuffer.m_dataByteCount);
-
+		// After this the gateway might quickly send a new message.
+        sendToGateway(serialInputBuffer.m_dataBuffer, serialInputBuffer.m_dataByteCount);
      }
      // Tell the sender that we are done and therefore ok to send more.
      // Serial sync response is always sent.
@@ -738,4 +767,9 @@ DEBUG("z m_dataBuffer[0]="); DEBUGln(serialInputBuffer.m_dataBuffer[0]);
   digitalWrite(LED,LOW);
 }
 
+void sendToGateway(void* buffer, int byteCount)
+{
+  radio.sendWithRetry(GATEWAYID, buffer, byteCount);
+  sleepMode.reset();
+}
 
