@@ -86,9 +86,9 @@
 #define DEBUGFlush();
 #endif
 
-#define BATTERY_SAMPLE_INTERVAL_MS 2000
+#define BATTERY_SAMPLE_INTERVAL_MS 100
 #define BATTERY_TRANSMIT_INTERVAL_MS 120000
-#define WAIT_FOR_RECEIVE_TIME_MS 10000
+#define WAIT_FOR_RECEIVE_TIME_MS 1500
 
 #define GATEWAYID 1
 
@@ -100,9 +100,50 @@ void printDataAsHex(uint8_t* dataBuffer, int len);
 void mySerialEvent();
 void Blink(byte PIN, int DELAY_MS);
 
+class MillisecondCounter
+{
+  public:
+  MillisecondCounter()
+  {
+    m_time = 0;
+    m_previousMillis = millis();
+  }
+
+  uint32_t get()
+  {
+    ReapMillis();
+    return m_time;
+  }
+
+  // This called just before we are about to sleep for the given time.
+  void notifySleep(uint32_t t)
+  {
+    ReapMillis();
+    m_time += t;
+  }
+
+
+  private:
+  uint32_t m_time;
+  uint32_t m_previousMillis;
+
+  void ReapMillis()
+  {
+    uint32_t currentMillis = millis();
+    m_time += currentMillis - m_previousMillis;
+    m_previousMillis = currentMillis;
+  }
+
+};
+
+MillisecondCounter g_millisCounter;
+
 class SerialInputBuffer
 {
   public:
+    // Latches true when data is received.  Cleared when the latch is read by method WasDataReceived.
+    bool m_dataReceived;
+
     uint8_t m_dataBuffer[63];
     uint8_t m_lastDataByte;
 
@@ -120,6 +161,7 @@ class SerialInputBuffer
 
     SerialInputBuffer()
     {
+      m_dataReceived = false;
       m_haveSerialNumber = false;
       m_errorCount = 0;
       startNewMessage();
@@ -234,6 +276,13 @@ class SerialInputBuffer
       }
     }
 
+    bool WasDataReceived()
+    {
+      bool wasDataReceived = m_dataReceived;
+      m_dataReceived = false;
+      return wasDataReceived;
+    }
+
     // Returns true when the end of a good message is detected.
     bool TakeFromSerial()
     {
@@ -247,6 +296,7 @@ class SerialInputBuffer
       // Pull data from serial until non available or we have complete message.
       while(!m_complete && Serial.available())
       {
+        m_dataReceived = true;
         char c = (char)Serial.read();
 
   //      DEBUG("read=");DEBUG(c);DEBUGln("");
@@ -481,9 +531,9 @@ class SampleBatteryStatus: public RecurringAction
   }
 };
 
-// EnableSleepMode triggers every 100ms.
+// EnableSleepMode triggers every 1500ms.
 // The system disables sleep mode when the radio transmits.
-// This action will reenable sleep mode after 100ms.
+// This action will reenable sleep mode after 1500ms.
 // The action timer needs to be reset when sleep mode is disabled.
 class EnableSleepMode : public RecurringAction
 {
@@ -498,7 +548,7 @@ class EnableSleepMode : public RecurringAction
 
   void reset()
   {
-    startTimer(millis());
+    startTimer(g_millisCounter.get());
     m_sleepModeFlag = false;
   }
 
@@ -523,7 +573,7 @@ class RecurringActionManager
 
   void doAll()
   {
-    unsigned long now = millis();
+    unsigned long now = g_millisCounter.get();
     for (int i = 0; i < m_count; i++)
     {
       RecurringAction* a = m_actions[i];
@@ -627,6 +677,8 @@ void sleep()
 
 // IMPORTANT to sleep radio before going idle.  If the radio receives something during idle, then receiveDone hangs after wakeup. 
   radio.sleep();  
+
+  g_millisCounter.notifySleep(8000);
   LowPower.idle(SLEEP_8S, ADC_OFF, TIMER2_OFF, TIMER1_OFF, TIMER0_OFF, 
                 SPI_OFF, USART0_ON, TWI_OFF);
   
@@ -763,6 +815,13 @@ DEBUG("z m_dataBuffer[0]="); DEBUGln(serialInputBuffer.m_dataBuffer[0]);
      // Serial sync response is always sent.
      SendSerialSyncResponse(serialInputBuffer.m_lastDataByte);
    }
+
+  if (serialInputBuffer.WasDataReceived())
+  {
+      // Something was received over serial. Reset the sleep mode timer, so that we don't go back to sleep
+      // for some time (1500ms)
+      sleepMode.reset();
+  }
 
   digitalWrite(LED,LOW);
 }
